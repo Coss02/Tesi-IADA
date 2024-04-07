@@ -12,7 +12,7 @@ from avalanche.benchmarks.utils import as_classification_dataset, AvalancheDatas
 from avalanche.benchmarks.classic import SplitMNIST
 from avalanche.benchmarks.generators import nc_benchmark
 from avalanche.models import SimpleMLP
-from avalanche.training import Naive
+from avalanche.training import Naive, Cumulative, ICaRL, EWC, Replay
 from avalanche.training.plugins import (
     ReplayPlugin,
     EWCPlugin,
@@ -125,7 +125,7 @@ def load_data(batch_size=64, seed = 0):
         [test_data, c_test_images_tensor], dim=0
     )  # Add channel dimension
     combined_test_labels = torch.cat([test_labels, c_test_labels_tensor], dim=0)
-    
+
     # combined_train_data = torch.cat(
     #     [train_data, c_train_images_tensor], dim=0
     # )  # Add channel dimension
@@ -133,23 +133,21 @@ def load_data(batch_size=64, seed = 0):
 
     # Create TensorDataset objects
     # train_dataset = TensorDataset(combined_train_data, combined_train_labels)
-    
+
     combined_test_dataset = TensorDataset(combined_test_data, combined_test_labels)
 
     # Create a train Dataset
     train_dataset = TensorDataset(train_data, train_labels)
     # Create DataLoader objects
     train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    
-    
-    
     test_dataLoader = DataLoader(
         combined_test_dataset, batch_size=batch_size, shuffle=False
     )
 
-    
+    # Set the desired order of the classes
     desired_order = [0, 10, 1, 11, 2, 12, 3, 13, 4, 14, 5, 15, 6, 16, 7, 17, 8, 18, 9, 19]
 
+    # Create the CL scenario
     scenario = nc_benchmark(
         combined_test_dataset,
         combined_test_dataset,
@@ -163,9 +161,15 @@ def load_data(batch_size=64, seed = 0):
     return train_dataLoader, test_dataLoader, scenario 
 
 
+def map_mixed_test(labels):
+    return torch.tensor([-1 if label > 9 else label for label in labels])
+
+def map_normal_test(labels, i, j):
+    return torch.tensor([-1 if j > i else label for label in labels])
+
+
 def train_and_eval(
-    train_stream, normal_test_stream, mixed_test_stream , cl_strategy, seed=0, device="cpu"
-):
+    train_stream, normal_test_stream, mixed_test_stream , cl_strategy, seed=0, device="cpu"):
     N_EXPERIENCES = len(train_stream)
 
     set_all_seed(seed)
@@ -179,9 +183,17 @@ def train_and_eval(
     )  # Forgetting I,J Matrix
     ood_matrix = np.zeros(shape=(N_EXPERIENCES, N_EXPERIENCES))  # OOD Matrix
 
-    ood_metrics = OODMetrics()
+    OOD_AUROC_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # OOD AUROC Matrix
+    OOD_AUPR_OUT_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # OOD AUPR-OUT Matrix
+    OOD_FPR95TPR_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # OOD FPR95TPR Matrix
+    OOD_AUPR_IN_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # OOD AUPR-IN Matrix
+    IID_AUPR_OUT_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # IID AUPR-OUT Matrix
+    IID_FPR95TPR_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # IID FPR95TPR Matrix
+    IID_AUPR_IN_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # IID AUPR-IN Matrix
+    IID_AUROC_matrix = np.zeros(shape=(N_EXPERIENCES,N_EXPERIENCES)) # IID AUROC Matrix
 
-    acc_k_matrix, forgetting_k_matrix, acc_ij_matrix, forgetting_ij_matrix, ood_matrix
+    OOD_metrics_large = OODMetrics()
+    IID_metrics_large = OODMetrics()
 
     for i, train_exp in enumerate(train_stream):
         set_all_seed(seed)
@@ -193,7 +205,8 @@ def train_and_eval(
         forgetting_k_matrix[i, 0] = results[f"StreamForgetting/eval_phase/test_stream"]
         print(results)
 
-        # Evaluation and OOD Scores
+        # Evaluation and OOD Scores on IID Data
+        IID_metrics_narrow = OODMetrics()
         for j, test_exp in enumerate(normal_test_stream):
             acc_ij_matrix[i, j] = results[
                 f"Top1_Acc_Exp/eval_phase/test_stream/Task000/Exp{str(j).zfill(3)}"
@@ -202,11 +215,11 @@ def train_and_eval(
                 forgetting_ij_matrix[i, j] = results[
                     f"ExperienceForgetting/eval_phase/test_stream/Task000/Exp{str(j).zfill(3)}"
                 ]
+
             # OOD Detection
             set_all_seed(seed)
             test_loader = DataLoader(test_exp.dataset, batch_size=32, shuffle=True)
             ood_scores = torch.tensor([]).to(device)
-
             # OOD Scores computing
             for batch in test_loader:
                 if len(batch) == 2:
@@ -217,10 +230,47 @@ def train_and_eval(
                 for plugin in cl_strategy.plugins:
                     if isinstance(plugin, OODDetectorPlugin):
                         detector = plugin.detector
-                ood_score_k = detector.predict(x)
-                ood_scores = torch.cat((ood_scores, ood_score_k))
+                    y = map_normal_test(y,i,j)
+                    ood_score_k = detector.predict(x)
+                    ood_scores = torch.cat((ood_scores, ood_score_k))
+                    IID_metrics_narrow.update(detector(x),y)
+                    IID_metrics_large.update(detector(x),y)
+
             ood_matrix[i, j] = ood_scores.mean()
-            
+            if (j > i):
+                dict_IID_M_narrow = IID_metrics_narrow.compute()
+                IID_AUROC_matrix[i, j] = dict_IID_M_narrow['AUROC']
+                IID_AUPR_IN_matrix[i, j] = dict_IID_M_narrow['AUPR-IN']
+                IID_AUPR_OUT_matrix[i, j] = dict_IID_M_narrow['AUPR-OUT']
+                IID_FPR95TPR_matrix[i, j] = dict_IID_M_narrow["FPR95TPR"]
+
+        for z, c_test_exp in enumerate(mixed_test_stream):
+            set_all_seed(seed)
+            test_loader = DataLoader(c_test_exp.dataset, batch_size=32, shuffle=True)
+            OOD_metrics_narrow = OODMetrics()
+
+            for batch in test_loader:
+                if len(batch) == 2:
+                    x, y = batch
+                else:
+                    x, y, *_ = batch
+
+                for plugin in cl_strategy.plugins:
+                    if isinstance(plugin, OODDetectorPlugin):
+                        detector = plugin.detector
+                    y = map_mixed_test(y)
+                    OOD_metrics_narrow.update(detector(x), y)
+                    OOD_metrics_large.update(detector(x), y)
+            dict_OOD_M_narrow = OOD_metrics_narrow.compute()
+            OOD_AUROC_matrix[i, z] = dict_OOD_M_narrow['AUROC']
+            OOD_AUPR_IN_matrix[i, z] = dict_OOD_M_narrow['AUPR-IN']
+            OOD_AUPR_OUT_matrix[i, z] = dict_OOD_M_narrow['AUPR-OUT']
+            OOD_FPR95TPR_matrix[i, z] = dict_OOD_M_narrow["FPR95TPR"]
+
+    print("Future IID OOD metrics ", IID_metrics_large.compute())
+    print("Corrupted images OOD metrics ",OOD_metrics_large.compute())
+    IID_AUROC_matrix = np.round(IID_AUROC_matrix, decimals=4)
+    OOD_AUROC_matrix = np.round(OOD_AUROC_matrix, decimals=4)
     acc_ij_matrix = np.round(acc_ij_matrix, decimals=4)
     ood_matrix = np.round(ood_matrix, decimals=4)
     acc_k_matrix = np.round(acc_k_matrix, decimals=4)
@@ -233,6 +283,14 @@ def train_and_eval(
         acc_k_matrix,
         forgetting_k_matrix,
         forgetting_ij_matrix,
+        OOD_AUROC_matrix,
+        OOD_AUPR_IN_matrix,
+        OOD_AUPR_OUT_matrix,
+        OOD_FPR95TPR_matrix,
+        IID_AUROC_matrix,
+        IID_AUPR_IN_matrix,
+        IID_AUPR_OUT_matrix,
+        IID_FPR95TPR_matrix,
     )
 
 
@@ -320,12 +378,6 @@ def main():
     normal_train_dataLoader, combined_test_dataLoader, combined_scenario = load_data()
 
     ##################################################################
-    # Load mixed dataset (IID + OOD)
-    ##################################################################
-    mixed_benchmark = load_complete_dataset(SEED)
-    mixed_test_stream = mixed_benchmark.test_stream
-
-    ##################################################################
     # Model, optimizer, criterion
     ##################################################################
     model = SimpleMLP(num_classes=10, hidden_size=50)
@@ -370,7 +422,22 @@ def main():
         acc_k_matrix,
         forgetting_k_matrix,
         forgetting_ij_matrix,
-    ) = train_and_eval(train_stream, test_stream, combined_scenario.test_stream,cl_strategy, SEED, DEVICE)
+        OOD_AUROC_matrix,
+        OOD_AUPR_IN_matrix,
+        OOD_AUPR_OUT_matrix,
+        OOD_FPR95TPR_matrix,
+        IID_AUROC_matrix,
+        IID_AUPR_IN_matrix,
+        IID_AUPR_OUT_matrix,
+        IID_FPR95TPR_matrix,
+    ) = train_and_eval(
+        train_stream,
+        test_stream,
+        combined_scenario.test_stream,
+        cl_strategy,
+        SEED,
+        DEVICE,
+    )
 
     ##################################################################
     # Visualize results
@@ -380,6 +447,11 @@ def main():
     fig, axs = plt.subplots(
         nrows, ncols, figsize=(ncols * fdim, nrows * fdim), squeeze=False
     )
+    
+    # Now we create a new figure for the OOD and IID AUROC Matrices
+    fig_ood, axs_ood = plt.subplots(nrows, 2, figsize=(2 * fdim, nrows * fdim), squeeze=False)
+    titles_ood = ["OOD AUROC Matrix", "IID AUROC Matrix"]
+    
     titles = [
         "Experience Accuracy",
         "OOD score",
@@ -465,6 +537,34 @@ def main():
     axs[0, 4].set_title(titles[4])
     axs[0, 4].axis("equal")
     axs[0, 4].set_ylabel("train exp id")
+    
+    sns.heatmap(
+        OOD_AUROC_matrix,
+        annot=True,
+        fmt="g",
+        ax=axs_ood[0, 0],
+        cmap="summer",
+        cbar=False,
+        xticklabels=np.arange(N_EXPERIENCES),
+    )
+    axs_ood[0, 0].set_title(titles_ood[0])
+    axs_ood[0, 0].axis("equal")
+    axs_ood[0, 0].set_ylabel("train exp id")
+    axs_ood[0, 0].set_xlabel("Corrupted test exp id")
+    
+    sns.heatmap(
+        IID_AUROC_matrix,
+        annot=True,
+        fmt="g",
+        ax=axs_ood[0, 1],
+        cmap="summer",
+        cbar=False,
+        xticklabels=np.arange(N_EXPERIENCES),
+    )
+    axs_ood[0, 1].set_title(titles_ood[1])
+    axs_ood[0, 1].axis("equal")
+    axs_ood[0, 1].set_ylabel("train exp id")
+    axs_ood[0, 1].set_xlabel("test exp id")
 
     # Refine, show and save figure
     fig.tight_layout()
@@ -473,6 +573,12 @@ def main():
         "experiments", exist_ok=True
     )  # if experiments folder does not exist create it
     fig.savefig("experiments/results.pdf")
+    
+    fig_ood.tight_layout()
+    fig_ood.show()
+    fig_ood.savefig("experiments/OOD_metrics.pdf")
+    
+    
     print("")
 
 
