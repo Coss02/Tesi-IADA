@@ -1,9 +1,13 @@
 import os
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from torch.optim import SGD
 from torch.utils.data import DataLoader, TensorDataset
+import torchvision.models as models
+from torchvision import transforms
 from avalanche.benchmarks.datasets import MNIST
 from avalanche.benchmarks.datasets.dataset_utils import default_dataset_location
 from avalanche.benchmarks.utils import as_classification_dataset, AvalancheDataset
@@ -18,6 +22,7 @@ from avalanche.training.plugins import (
     EWCPlugin,
     AGEMPlugin,
     EvaluationPlugin,
+    LwFPlugin,
 )
 from avalanche.evaluation.metrics import (
     forgetting_metrics,
@@ -48,41 +53,7 @@ from utils.data import (
     get_full_dataset_experience,
 )
 
-# mpl.rcParams['mathtext.fontset'] = 'stix'
-# mpl.rcParams['font.size'] = 18
-# mpl.rcParams['font.family'] = 'STIXGeneral'
-# mpl.rcParams['pdf.fonttype'] = 42
-# mpl.rcParams['ps.fonttype'] = 42
-# mpl.rcParams['mathtext.fontset'] = 'stix'
-
 from avalanche_ood_plugins.detectors import OODDetectorPlugin
-
-
-def load_corrupted_mnist(seed):
-    test_images = np.load("./datasets/brightness02/test/test_images.npy")
-    test_labels = np.load("./datasets/brightness02/test/test_labels.npy")
-    train_images = np.load("./datasets/brightness02/train/train_images.npy")
-    train_labels = np.load("./datasets/brightness02/train/train_labels.npy")
-
-    # Convert NumPy arrays to PyTorch tensors
-    test_images_tensor = torch.tensor(test_images)
-    test_labels_tensor = torch.tensor(test_labels)
-    train_images_tensor = torch.tensor(train_images)
-    train_labels_tensor = torch.tensor(train_labels)
-
-    # Create TensorDataset
-    test = TensorDataset(test_images_tensor, test_labels_tensor)
-    train = TensorDataset(train_images_tensor, train_labels_tensor)
-
-    scenario = nc_benchmark(
-        train,
-        test,
-        n_experiences=10,
-        shuffle=False,
-        seed=seed,
-        task_labels=False,
-    )
-    return scenario
 
 
 def load_data(batch_size=64, seed = 0):
@@ -160,13 +131,11 @@ def load_data(batch_size=64, seed = 0):
 
     return train_dataLoader, test_dataLoader, scenario 
 
-
 def map_mixed_test(labels):
     return torch.tensor([-1 if label > 9 else label for label in labels])
 
 def map_normal_test(labels, i, j):
     return torch.tensor([-1 if j > i else label for label in labels])
-
 
 def train_and_eval(
     train_stream, normal_test_stream, mixed_test_stream , cl_strategy, seed=0, device="cpu"):
@@ -293,65 +262,25 @@ def train_and_eval(
         IID_FPR95TPR_matrix,
     )
 
-
 def remove_channel_dimension(dataset):
     modified_data = []
     for data in dataset:
         modified_data.append(data.squeeze(-1))  # Remove the last channel dimension
     return torch.stack(modified_data)  # Stack the modified data and return as a tensor
 
+def initialize_feature_extractor(num_classes):
+    # Load the pre-trained ResNet18 model
+    model = models.resnet18(pretrained=True)
 
-def load_complete_dataset(seed=0):
-    datadir = default_dataset_location("mnist")
-    train_MNIST = MNIST(datadir, train=True, download=False)
-    test_MNIST = MNIST(datadir, train=False, download=False)
+    model.conv1 = torch.nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
 
-    # Extracting train data/labels and test data/labels
-    train_data = train_MNIST.data
-    train_labels = train_MNIST.targets
-    test_data = test_MNIST.data
-    test_labels = test_MNIST.targets
-
-    c_test_images = np.load("./datasets/brightness02/test/test_images.npy")
-    c_test_labels = np.load("./datasets/brightness02/test/test_labels.npy")
-    c_train_images = np.load("./datasets/brightness02/train/train_images.npy")
-    c_train_labels = np.load("./datasets/brightness02/train/train_labels.npy")
-
-    # Convert NumPy arrays to PyTorch tensors
-    test_images_tensor = torch.tensor(test_data)
-    test_labels_tensor = torch.tensor(test_labels)
-    train_images_tensor = torch.tensor(train_data)
-    train_labels_tensor = torch.tensor(train_labels)
-
-    c_test_images_tensor = torch.tensor(c_test_images)
-    c_test_labels_tensor = torch.tensor(c_test_labels)
-    c_train_images_tensor = torch.tensor(c_train_images)
-    c_train_labels_tensor = torch.tensor(c_train_labels)
-
-    c_test_images_tensor = remove_channel_dimension(c_test_images_tensor)
-    c_train_images_tensor = remove_channel_dimension(c_train_images_tensor)
-
-    combined_train_data = torch.cat([train_images_tensor, c_train_images_tensor], dim=0)
-    combined_train_labels = torch.cat(
-        [train_labels_tensor, c_train_labels_tensor], dim=0
+    num_ftrs = model.fc.in_features
+    model.fc = torch.nn.Sequential(
+        torch.nn.Flatten(),  # This flattens the output of the last conv layer
+        torch.nn.Linear(num_ftrs, num_classes)  # Adjusts to the desired number of classes
     )
-    combined_test_data = torch.cat([test_images_tensor, c_test_images_tensor], dim=0)
-    combined_test_labels = torch.cat([test_labels_tensor, c_test_labels_tensor], dim=0)
 
-    combined_train = TensorDataset(combined_train_data, combined_train_labels)
-    combined_test = TensorDataset(combined_test_data, combined_test_labels)
-
-    print(combined_test)
-
-    scenario = nc_benchmark(
-        combined_train,
-        combined_test,
-        n_experiences=10,
-        shuffle=False,
-        seed=seed,
-        task_labels=False,
-    )
-    return scenario
+    return model
 
 
 def main():
@@ -378,11 +307,16 @@ def main():
     normal_train_dataLoader, combined_test_dataLoader, combined_scenario = load_data()
 
     ##################################################################
-    # Model, optimizer, criterion
+    # Model, optimizer, criterion, feautre_extractor, buffer_transform
     ##################################################################
     model = SimpleMLP(num_classes=10, hidden_size=50)
+    feature_extractor = initialize_feature_extractor(10)
     optimizer = SGD(model.parameters(), lr=0.001, momentum=0.9)
     criterion = CrossEntropyLoss()
+    buffer_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))  # Normalizing MNIST
+    ])
 
     ##################################################################
     # Instantiate CL and OOD methods as Avalanche plugins
@@ -390,9 +324,9 @@ def main():
     # instantiate CL strategy plugin
     replay = ReplayPlugin(
         mem_size=50
-    )  # classic Avalanche plugin that implements Replay strategy
-    # ewc = EWCPlugin(ewc_lambda=1)
-
+    )
+    ewc = EWCPlugin(ewc_lambda=1, mode="separate",keep_importance_data=True)
+    lwf = LwFPlugin(alpha=0.01, temperature=0.2)
     # instantiate OOD strategy plugin
     detector = OpenMax(model, tailsize=50, alpha=10, euclid_weight=0.5)
     detector_plugin = OODDetectorPlugin(detector)
@@ -404,7 +338,7 @@ def main():
         forgetting_metrics(experience=True, stream=True),
         loggers=[InteractiveLogger()],
     )
-    cl_strategy = Naive(
+    cl_strategy_Naive = Naive(
         model,
         optimizer,
         criterion,
@@ -412,7 +346,32 @@ def main():
         train_epochs=EPOCHS,
         eval_mb_size=32,
         device=DEVICE,
-        plugins=[detector_plugin, replay],
+        plugins=[detector_plugin, lwf],
+        evaluator=eval_plugin,
+    )
+    cl_strategy_Cumulative = Cumulative(
+        model,
+        optimizer,
+        criterion,
+        train_mb_size=32,
+        train_epochs=EPOCHS,
+        eval_mb_size=32,
+        device=DEVICE,
+        plugins=[detector_plugin],
+        evaluator=eval_plugin,
+    )
+    cl_strategy_ICaRL = ICaRL(
+        feature_extractor,
+        model,
+        optimizer,
+        memory_size=1000,
+        buffer_transform = buffer_transform,
+        fixed_memory=False,
+        train_mb_size=32,
+        train_epochs=EPOCHS,
+        eval_mb_size=32,
+        device=DEVICE,
+        plugins=[detector_plugin],
         evaluator=eval_plugin,
     )
 
@@ -434,7 +393,7 @@ def main():
         train_stream,
         test_stream,
         combined_scenario.test_stream,
-        cl_strategy,
+        cl_strategy_Naive,
         SEED,
         DEVICE,
     )
@@ -447,11 +406,11 @@ def main():
     fig, axs = plt.subplots(
         nrows, ncols, figsize=(ncols * fdim, nrows * fdim), squeeze=False
     )
-    
+
     # Now we create a new figure for the OOD and IID AUROC Matrices
     fig_ood, axs_ood = plt.subplots(nrows, 2, figsize=(2 * fdim, nrows * fdim), squeeze=False)
     titles_ood = ["OOD AUROC Matrix", "IID AUROC Matrix"]
-    
+
     titles = [
         "Experience Accuracy",
         "OOD score",
@@ -537,7 +496,7 @@ def main():
     axs[0, 4].set_title(titles[4])
     axs[0, 4].axis("equal")
     axs[0, 4].set_ylabel("train exp id")
-    
+
     sns.heatmap(
         OOD_AUROC_matrix,
         annot=True,
@@ -551,7 +510,7 @@ def main():
     axs_ood[0, 0].axis("equal")
     axs_ood[0, 0].set_ylabel("train exp id")
     axs_ood[0, 0].set_xlabel("Corrupted test exp id")
-    
+
     sns.heatmap(
         IID_AUROC_matrix,
         annot=True,
@@ -573,12 +532,11 @@ def main():
         "experiments", exist_ok=True
     )  # if experiments folder does not exist create it
     fig.savefig("experiments/results.pdf")
-    
+
     fig_ood.tight_layout()
     fig_ood.show()
     fig_ood.savefig("experiments/OOD_metrics.pdf")
-    
-    
+
     print("")
 
 
